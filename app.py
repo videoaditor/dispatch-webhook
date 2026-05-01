@@ -61,14 +61,24 @@ def verify_slack_signature(req) -> bool:
     except ValueError:
         return False
 
-    sig_basestring = f"v0:{timestamp}:{req.get_data(as_text=True)}"
+    body = req.get_data(as_text=True)
+    sig_basestring = f"v0:{timestamp}:{body}"
     my_sig = "v0=" + hmac.new(
         SLACK_SIGNING_SECRET.encode("utf-8"),
         sig_basestring.encode("utf-8"),
         hashlib.sha256
     ).hexdigest()
 
-    return hmac.compare_digest(my_sig, slack_sig)
+    valid = hmac.compare_digest(my_sig, slack_sig)
+    if not valid:
+        # Temporary debug to diagnose 401 mismatch — strip after fix
+        print(f"[SIG DEBUG] ts={timestamp}")
+        print(f"[SIG DEBUG] body_len={len(body)}")
+        print(f"[SIG DEBUG] body_first200={body[:200]!r}")
+        print(f"[SIG DEBUG] slack_sig={slack_sig}")
+        print(f"[SIG DEBUG] our_sig=  {my_sig}")
+        print(f"[SIG DEBUG] secret_len={len(SLACK_SIGNING_SECRET)} (should be 32)")
+    return valid
 
 
 # ── SLACK API HELPERS ─────────────────────────────────────────────────────────
