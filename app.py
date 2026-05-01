@@ -158,6 +158,10 @@ def handle_action():
         feedback = f"✅ *Accepted!* You're on this one. Trello card will be updated shortly."
     elif verb == "decline":
         feedback = f"❌ *Declined.* Got it — we'll find another editor."
+    elif verb == "approve_dispatch":
+        feedback = f"✅ *Approved.* Dispatching to the editor now…"
+    elif verb == "reject_dispatch":
+        feedback = f"❌ *Rejected.* Card will not be dispatched."
     else:
         feedback = f"⚡ Action received: `{action_id}`"
 
