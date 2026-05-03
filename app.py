@@ -20,6 +20,7 @@ Environment variables (set in Railway dashboard):
 import hmac
 import hashlib
 import time
+import uuid
 import json
 import os
 import requests
@@ -32,9 +33,10 @@ app = Flask(__name__)
 SLACK_BOT_TOKEN      = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
 
-# Channel where DISPATCH_ACTION messages are posted for the heartbeat to read.
-# Default: automations channel (C07UL6BAG1Z). Override with DISPATCH_CHANNEL env var.
-DISPATCH_CHANNEL = os.environ.get("DISPATCH_CHANNEL", "C07UL6BAG1Z")
+# Filesystem inbox shared with the dispatch-agent on the same host.
+# Webhook writes JSON files here; the agent's poller reads + deletes them.
+# Replaces the legacy Slack-channel message bus.
+ACTION_INBOX_DIR = os.environ.get("ACTION_INBOX_DIR", "/opt/dispatch-agent/action_inbox")
 
 # ── SIGNATURE VERIFICATION ────────────────────────────────────────────────────
 
@@ -73,20 +75,41 @@ def verify_slack_signature(req) -> bool:
 
 # ── SLACK API HELPERS ─────────────────────────────────────────────────────────
 
-def post_to_slack(channel: str, text: str) -> dict:
-    """Post a plain message to a Slack channel using the bot token."""
-    resp = requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-        json={
-            "channel": channel,
-            "text": text,
-            "unfurl_links": False,
-            "unfurl_media": False,
-        },
-        timeout=5,
-    )
-    return resp.json()
+def write_to_inbox(verb: str, card_id: str, editor_key: str, user_id: str) -> bool:
+    """
+    Write an action payload to the agent's filesystem inbox.
+    Atomic via .tmp + rename so the reader never sees a half-written file.
+    Returns True on success.
+    """
+    try:
+        os.makedirs(ACTION_INBOX_DIR, exist_ok=True)
+    except Exception as e:
+        print(f"[ERROR] could not create inbox dir {ACTION_INBOX_DIR}: {e}")
+        return False
+
+    payload = {
+        "ts":         time.time(),
+        "verb":       verb,
+        "card_id":    card_id,
+        "editor_key": editor_key,
+        "user_id":    user_id,
+    }
+    fname  = f"{int(payload['ts']*1000)}_{uuid.uuid4().hex[:8]}.json"
+    final  = os.path.join(ACTION_INBOX_DIR, fname)
+    tmp    = final + ".tmp"
+
+    try:
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.rename(tmp, final)
+        return True
+    except Exception as e:
+        print(f"[ERROR] inbox write failed for {verb}|{card_id}: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
 
 
 def replace_original(response_url: str, text: str) -> None:
@@ -168,14 +191,11 @@ def handle_action():
     if response_url:
         replace_original(response_url, feedback)
 
-    # 6. Post DISPATCH_ACTION to the automations/dispatch channel
-    #    Format: DISPATCH_ACTION: {verb}|{card_id}|{editor_key}|{user_id}
-    dispatch_text = f"DISPATCH_ACTION: {verb}|{card_id}|{editor_key}|{user_id}"
-    result = post_to_slack(DISPATCH_CHANNEL, dispatch_text)
-    if not result.get("ok"):
-        print(f"[WARN] Failed to post dispatch action: {result.get('error')}")
+    # 6. Drop the action into the agent's filesystem inbox.
+    if write_to_inbox(verb, card_id, editor_key, user_id):
+        print(f"[OK] Wrote inbox entry: {verb}|{card_id}|{editor_key}|{user_id}")
     else:
-        print(f"[OK] Posted dispatch action to {DISPATCH_CHANNEL}: {dispatch_text}")
+        print(f"[ERROR] Inbox write failed for {verb}|{card_id} — action will be lost")
 
     # 7. ACK to Slack — must return 200 within 3 seconds
     return "", 200
