@@ -185,6 +185,8 @@ def handle_action():
         feedback = f"✅ *Approved.* Dispatching to the editor now…"
     elif verb == "reject_dispatch":
         feedback = f"❌ *Rejected.* Card will not be dispatched."
+    elif verb == "remove_card":
+        feedback = f"🚫 *Removed from rotation.* This card will not be dispatched again."
     else:
         feedback = f"⚡ Action received: `{action_id}`"
 
