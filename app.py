@@ -244,6 +244,33 @@ def _require_admin_token():
     return None
 
 
+def _admin_dispatch_action(verb):
+    """
+    Shared body for the dashboard admin endpoints that act on a pending
+    approval (approve_dispatch, reject_dispatch). Body must include both
+    card_id and editor_key — the agent's on_*_dispatch handlers need both
+    to look up the pending_approval entry and propose the correct editor.
+    """
+    if request.method == "OPTIONS":
+        return _apply_cors(make_response("", 204))
+
+    err = _require_admin_token()
+    if err is not None:
+        return err
+
+    body = request.get_json(silent=True) or {}
+    card_id    = (body.get("card_id") or "").strip()
+    editor_key = (body.get("editor_key") or "").strip()
+    if not card_id or not editor_key:
+        return _apply_cors(jsonify({"error": "missing card_id or editor_key"})), 400
+
+    if write_to_inbox(verb, card_id, editor_key, "dashboard"):
+        print(f"[ADMIN] dashboard {verb} queued: card={card_id} editor={editor_key}")
+        return _apply_cors(jsonify({"ok": True, "verb": verb, "card_id": card_id, "editor_key": editor_key}))
+
+    return _apply_cors(jsonify({"error": "inbox write failed"})), 500
+
+
 @app.route("/admin/remove_card", methods=["POST", "OPTIONS"])
 def admin_remove_card():
     """
@@ -252,9 +279,7 @@ def admin_remove_card():
     runs dispatch.on_remove_card(card_id, "dashboard").
     """
     if request.method == "OPTIONS":
-        # CORS preflight
-        resp = make_response("", 204)
-        return _apply_cors(resp)
+        return _apply_cors(make_response("", 204))
 
     err = _require_admin_token()
     if err is not None:
@@ -271,6 +296,28 @@ def admin_remove_card():
         return _apply_cors(jsonify({"ok": True, "card_id": card_id}))
 
     return _apply_cors(jsonify({"error": "inbox write failed"})), 500
+
+
+@app.route("/admin/approve_dispatch", methods=["POST", "OPTIONS"])
+def admin_approve_dispatch():
+    """
+    Dashboard "Approve" button on a pending-approval card. Body:
+    {"card_id": "...", "editor_key": "..."}. The agent's
+    dispatch.on_approve_dispatch handles re-ranking if the editor is no
+    longer available, exactly like the Slack approval flow.
+    """
+    return _admin_dispatch_action("approve_dispatch")
+
+
+@app.route("/admin/reject_dispatch", methods=["POST", "OPTIONS"])
+def admin_reject_dispatch():
+    """
+    Dashboard "Skip" button on a pending-approval card. Body:
+    {"card_id": "...", "editor_key": "..."}. Records the editor in
+    declined_by and rotates to the next-best, mirroring Tim's Reject
+    button in Slack.
+    """
+    return _admin_dispatch_action("reject_dispatch")
 
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
