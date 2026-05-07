@@ -24,7 +24,7 @@ import uuid
 import json
 import os
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 
 app = Flask(__name__)
 
@@ -37,6 +37,14 @@ SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
 # Webhook writes JSON files here; the agent's poller reads + deletes them.
 # Replaces the legacy Slack-channel message bus.
 ACTION_INBOX_DIR = os.environ.get("ACTION_INBOX_DIR", "/opt/dispatch-agent/action_inbox")
+
+# Shared secret guarding /admin/* endpoints called by the dashboard. The same
+# value is embedded in the dashboard HTML at generation time and sent as
+# X-Admin-Token. Empty value disables admin endpoints (returns 503).
+DASHBOARD_ADMIN_TOKEN = os.environ.get("DASHBOARD_ADMIN_TOKEN", "")
+
+# Origins allowed to call /admin/* (CORS). Only the dispatch dashboard.
+ADMIN_ALLOWED_ORIGINS = {"https://dispatch-dashboard.aditor.ai"}
 
 # ── SIGNATURE VERIFICATION ────────────────────────────────────────────────────
 
@@ -201,6 +209,68 @@ def handle_action():
 
     # 7. ACK to Slack — must return 200 within 3 seconds
     return "", 200
+
+
+# ── ADMIN ENDPOINTS (called by the dispatch dashboard) ───────────────────────
+#
+# These endpoints are gated by a shared X-Admin-Token header that matches
+# DASHBOARD_ADMIN_TOKEN env var. The same token is embedded in the dashboard
+# HTML at generation time. Repo is private, so the token is only readable
+# by collaborators — this is the placeholder until Cloudflare Access lands
+# in front of the dashboard, at which point the JWT becomes the auth.
+
+def _apply_cors(resp):
+    """Attach CORS headers if the request Origin is in the allowlist."""
+    origin = request.headers.get("Origin", "")
+    if origin in ADMIN_ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"]  = origin
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Token"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Vary"] = "Origin"
+    return resp
+
+
+def _require_admin_token():
+    """
+    Validate the X-Admin-Token header. Returns a Flask response on failure
+    (caller should return it directly), or None on success.
+    """
+    if not DASHBOARD_ADMIN_TOKEN:
+        return _apply_cors(jsonify({"error": "admin disabled — DASHBOARD_ADMIN_TOKEN not set"})), 503
+    supplied = request.headers.get("X-Admin-Token", "")
+    if not supplied or not hmac.compare_digest(supplied, DASHBOARD_ADMIN_TOKEN):
+        print(f"[ADMIN] rejected: bad/missing X-Admin-Token from {request.headers.get('Origin','-')}")
+        return _apply_cors(jsonify({"error": "unauthorized"})), 401
+    return None
+
+
+@app.route("/admin/remove_card", methods=["POST", "OPTIONS"])
+def admin_remove_card():
+    """
+    Dashboard "Remove from rotation" button. Body: {"card_id": "..."}.
+    Writes a remove_card inbox entry; the agent's poller picks it up and
+    runs dispatch.on_remove_card(card_id, "dashboard").
+    """
+    if request.method == "OPTIONS":
+        # CORS preflight
+        resp = make_response("", 204)
+        return _apply_cors(resp)
+
+    err = _require_admin_token()
+    if err is not None:
+        return err
+
+    body = request.get_json(silent=True) or {}
+    card_id = (body.get("card_id") or "").strip()
+    if not card_id:
+        return _apply_cors(jsonify({"error": "missing card_id"})), 400
+
+    user_id = "dashboard"
+    if write_to_inbox("remove_card", card_id, "unknown", user_id):
+        print(f"[ADMIN] dashboard remove_card queued: card={card_id}")
+        return _apply_cors(jsonify({"ok": True, "card_id": card_id}))
+
+    return _apply_cors(jsonify({"error": "inbox write failed"})), 500
 
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
