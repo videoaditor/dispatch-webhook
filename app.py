@@ -326,10 +326,10 @@ def admin_reject_dispatch():
 # directly; both services live under /opt and have permission to read each
 # other's state. Overridable for non-prod runs.
 DISPATCH_AGENT_DIR = os.environ.get("DISPATCH_AGENT_DIR", "/opt/dispatch-agent")
-_STATE_FILE     = os.path.join(DISPATCH_AGENT_DIR, "dispatch_state.json")
-_LOG_FILE       = os.path.join(DISPATCH_AGENT_DIR, "interaction_log.json")
-_TRUST_FILE     = os.path.join(DISPATCH_AGENT_DIR, "trust_events.json")
-_REGISTRY_FILE  = os.path.join(DISPATCH_AGENT_DIR, "editor_registry.json")
+_STATE_FILE       = os.path.join(DISPATCH_AGENT_DIR, "dispatch_state.json")
+_ACTION_LOG_FILE  = os.path.join(DISPATCH_AGENT_DIR, "action_log.jsonl")
+_TRUST_FILE       = os.path.join(DISPATCH_AGENT_DIR, "trust_events.json")
+_REGISTRY_FILE    = os.path.join(DISPATCH_AGENT_DIR, "editor_registry.json")
 
 
 def _safe_load_json(path, default):
@@ -339,6 +339,38 @@ def _safe_load_json(path, default):
     except (FileNotFoundError, json.JSONDecodeError) as e:
         print(f"[WARN] _safe_load_json {path}: {e}")
         return default
+
+
+def _safe_tail_jsonl(path, n=500):
+    """Read the last N JSON lines from a JSONL file. Skips malformed lines."""
+    try:
+        # Tail efficiently for big files: seek to a window from the end and
+        # parse forward. 500 events × ~250 bytes ≈ 125KB; 256KB is plenty
+        # of margin.
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            window = min(size, 256 * 1024)
+            f.seek(size - window)
+            chunk = f.read().decode("utf-8", errors="replace")
+        lines = chunk.splitlines()
+        if size > window:
+            lines = lines[1:]  # drop the partial first line we may have sliced
+        events = []
+        for line in lines[-n:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return events
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        print(f"[WARN] _safe_tail_jsonl {path}: {e}")
+        return []
 
 
 @app.route("/api/state", methods=["GET", "OPTIONS"])
@@ -356,7 +388,7 @@ def api_state():
         return err
 
     state    = _safe_load_json(_STATE_FILE,    default={"dispatched": {}, "pending_approval": {}})
-    events   = _safe_load_json(_LOG_FILE,      default=[])
+    events   = _safe_tail_jsonl(_ACTION_LOG_FILE, n=500)
     trust    = _safe_load_json(_TRUST_FILE,    default=[])
     registry = _safe_load_json(_REGISTRY_FILE, default={"editors": {}})
 
