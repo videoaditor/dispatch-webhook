@@ -399,6 +399,7 @@ def api_state():
             "tier":       ed.get("tier", ""),
             "approved":   ed.get("approved", True),
             "brands":     ed.get("brands", []),
+            "slack_id":   ed.get("slack_id", ""),
         }
         for k, ed in registry.get("editors", {}).items()
     }
