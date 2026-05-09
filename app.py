@@ -225,7 +225,7 @@ def _apply_cors(resp):
     if origin in ADMIN_ALLOWED_ORIGINS:
         resp.headers["Access-Control-Allow-Origin"]  = origin
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Token"
-        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         resp.headers["Vary"] = "Origin"
     return resp
 
@@ -318,6 +318,72 @@ def admin_reject_dispatch():
     button in Slack.
     """
     return _admin_dispatch_action("reject_dispatch")
+
+
+# ── READ API (called by the dispatch dashboard SPA) ──────────────────────────
+
+# Paths on the same host as the dispatch-agent. The webhook reads these files
+# directly; both services live under /opt and have permission to read each
+# other's state. Overridable for non-prod runs.
+DISPATCH_AGENT_DIR = os.environ.get("DISPATCH_AGENT_DIR", "/opt/dispatch-agent")
+_STATE_FILE     = os.path.join(DISPATCH_AGENT_DIR, "dispatch_state.json")
+_LOG_FILE       = os.path.join(DISPATCH_AGENT_DIR, "interaction_log.json")
+_TRUST_FILE     = os.path.join(DISPATCH_AGENT_DIR, "trust_events.json")
+_REGISTRY_FILE  = os.path.join(DISPATCH_AGENT_DIR, "editor_registry.json")
+
+
+def _safe_load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"[WARN] _safe_load_json {path}: {e}")
+        return default
+
+
+@app.route("/api/state", methods=["GET", "OPTIONS"])
+def api_state():
+    """
+    Snapshot of everything the dashboard SPA needs in one round-trip:
+    dispatched cards, pending approvals, removed cards, recent events,
+    weekly trust events, and a slim editor lookup. Same auth as /admin/*.
+    """
+    if request.method == "OPTIONS":
+        return _apply_cors(make_response("", 204))
+
+    err = _require_admin_token()
+    if err is not None:
+        return err
+
+    state    = _safe_load_json(_STATE_FILE,    default={"dispatched": {}, "pending_approval": {}})
+    events   = _safe_load_json(_LOG_FILE,      default=[])
+    trust    = _safe_load_json(_TRUST_FILE,    default=[])
+    registry = _safe_load_json(_REGISTRY_FILE, default={"editors": {}})
+
+    editors_slim = {
+        k: {
+            "name":       ed.get("name", k),
+            "label_name": ed.get("label_name", ""),
+            "tier":       ed.get("tier", ""),
+            "approved":   ed.get("approved", True),
+            "brands":     ed.get("brands", []),
+        }
+        for k, ed in registry.get("editors", {}).items()
+    }
+
+    payload = {
+        "server_time":      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "dispatched":       state.get("dispatched", {}),
+        "pending_approval": state.get("pending_approval", {}),
+        "removed_cards":    state.get("removed_cards", {}),
+        "events":           events[-300:],   # most recent 300 — 1-2 weeks worth
+        "trust_events":     trust[-500:],
+        "editors":          editors_slim,
+    }
+
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store"
+    return _apply_cors(resp)
 
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
