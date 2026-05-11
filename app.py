@@ -1,28 +1,38 @@
 #!/usr/bin/env python3
 """
-app.py — Slack interactivity webhook for Aditor Dispatch
-Deployed on Railway at: https://aditor-dispatch-webhook.up.railway.app (set after first deploy)
+app.py — Slack interactivity webhook + dashboard API + health endpoint
 
-Purpose:
-  Receives Slack button click payloads (Accept / Decline from dispatch messages).
-  Immediately ACKs with 200, gives visual feedback, and posts a DISPATCH_ACTION
-  message to the automations channel so the Mac Mini heartbeat can pick it up.
+Deployed as dispatch-webhook.service (gunicorn) on the Hetzner Aditor server
+behind dispatch.aditor.ai. Receives Slack button click payloads, writes them
+to /opt/dispatch-agent/action_inbox/ as JSON files, and exposes read-only
+APIs for the dashboard SPA and external health monitoring.
 
-Interactivity URL (set in Slack App settings):
-  https://<RAILWAY_URL>/slack/actions
+Endpoints:
+  POST /slack/actions          — Slack interactivity (button clicks)
+  GET  /health                 — Health snapshot for n8n monitor (no auth, read-only)
+  GET  /api/state              — Dashboard SPA snapshot (admin token required)
+  POST /admin/remove_card      — Dashboard admin action
+  POST /admin/approve_dispatch — Dashboard admin action
+  POST /admin/reject_dispatch  — Dashboard admin action
 
-Environment variables (set in Railway dashboard):
-  SLACK_BOT_TOKEN       <set in Railway dashboard>
-  SLACK_SIGNING_SECRET  <from api.slack.com/apps -> Basic Information -> Signing Secret>
-  DISPATCH_CHANNEL      C07UL6BAG1Z  (automations channel — or create #dispatch-actions)
+Environment variables (loaded by systemd from /opt/dispatch-webhook/.env):
+  SLACK_BOT_TOKEN        Slack bot token
+  SLACK_SIGNING_SECRET   Slack request signing secret
+  DASHBOARD_ADMIN_TOKEN  Shared secret for /admin/* and /api/state
+  ACTION_INBOX_DIR       Defaults to /opt/dispatch-agent/action_inbox
+  DISPATCH_AGENT_DIR     Defaults to /opt/dispatch-agent
 """
 
 import hmac
 import hashlib
+import shutil
 import time
 import uuid
 import json
 import os
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 import requests
 from flask import Flask, request, jsonify, make_response
 
@@ -136,8 +146,23 @@ def replace_original(response_url: str, text: str) -> None:
 
 @app.route("/health")
 def health():
-    """Health check endpoint for Railway."""
-    return "ok", 200
+    """
+    Health snapshot for external monitors (n8n). Read-only — never calls
+    Trello/Slack/Airtable. Aggregates filesystem signals written by the
+    dispatch-agent scheduler and reports a top-level status with reasons.
+    """
+    out = {
+        "status":         "ok",
+        "checked_at":     datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "scheduler":      _scheduler_health(),
+        "inbox":          _inbox_health(),
+        "state":          _state_health(),
+        "drift":          _drift_health(),
+        "external_apis":  {"airtable": _airtable_health()},
+        "disk":           _disk_health(),
+    }
+    out["status"], out["reasons"] = _derive_status(out)
+    return jsonify(out)
 
 
 @app.route("/slack/actions", methods=["POST"])
@@ -417,6 +442,231 @@ def api_state():
     resp = jsonify(payload)
     resp.headers["Cache-Control"] = "no-store"
     return _apply_cors(resp)
+
+
+# ── HEALTH HELPERS ────────────────────────────────────────────────────────────
+# All thresholds for the /health endpoint live here so they're easy to tune.
+
+CET_TZ = ZoneInfo("Europe/Berlin")
+
+# Files written by the dispatch-agent scheduler. Paths resolve via DISPATCH_AGENT_DIR.
+_HEARTBEAT_FILE       = os.path.join(DISPATCH_AGENT_DIR, "heartbeat.json")
+_SCHEDULER_STATE_FILE = os.path.join(DISPATCH_AGENT_DIR, "scheduler_state.json")
+_DRIFT_REPORT_FILE    = os.path.join(DISPATCH_AGENT_DIR, "drift_report.json")
+_AIRTABLE_OK_FILE     = os.path.join(DISPATCH_AGENT_DIR, "airtable_last_success.json")
+_AIRTABLE_ERR_FILE    = os.path.join(DISPATCH_AGENT_DIR, "airtable_errors.jsonl")
+
+# Scheduler windows (hour in Europe/Berlin). Keep in sync with scheduler.py.
+_WINDOWS = [
+    ("w1",  "08:00",  8, False),  # (key, label, hour, conditional)
+    ("w2",  "13:00", 13, False),
+    ("w2b", "17:00", 17, True),   # conditional — only fires if needs_recheck=True
+    ("w3",  "21:00", 21, False),
+]
+_WINDOW_GRACE_MIN = 5  # minutes after the trigger before "missed"
+
+# Thresholds for status promotion. Tune here; n8n side mirrors these but
+# evaluates independently so the workflow doesn't fully trust this code.
+_HB_WARN_S         = 120     # heartbeat older than this → warn
+_HB_RED_S          = 600     # … and this → red
+_INBOX_WARN_DEPTH  = 10
+_INBOX_WARN_OLDEST = 300     # seconds
+_STATE_WARN_AGE_S  = 86400   # state file untouched for a day → warn
+_DISK_WARN_PCT     = 80
+_DISK_RED_PCT      = 95
+
+
+def _file_mtime_age_s(path):
+    try:
+        return max(0, int(time.time() - os.path.getmtime(path)))
+    except OSError:
+        return None
+
+
+def _scheduler_health():
+    hb       = _safe_load_json(_HEARTBEAT_FILE, default=None)
+    hb_age   = _file_mtime_age_s(_HEARTBEAT_FILE)
+    sched    = _safe_load_json(_SCHEDULER_STATE_FILE, default={})
+    state    = _safe_load_json(_STATE_FILE, default={})
+    ran      = (sched or {}).get("ran_today", {})
+
+    now_cet  = datetime.now(CET_TZ)
+    today    = now_cet.strftime("%Y-%m-%d")
+    minutes  = now_cet.hour * 60 + now_cet.minute
+
+    windows  = {}
+    for key, label, hour, conditional in _WINDOWS:
+        trigger = hour * 60
+        if ran.get(key) == today:
+            windows[label] = "ran"
+        elif minutes < trigger:
+            windows[label] = "pending"
+        elif minutes < trigger + _WINDOW_GRACE_MIN:
+            windows[label] = "pending"   # within grace window
+        else:
+            # Past trigger + grace, did not run today.
+            if conditional:
+                # w2b only fires if Window 2 set needs_recheck=True. If the
+                # flag was never set today, skipping is correct, not a miss.
+                windows[label] = "skipped" if not state.get("needs_recheck") else "missed"
+            else:
+                windows[label] = "missed"
+
+    return {
+        "heartbeat_present": hb is not None,
+        "heartbeat_age_s":   hb_age,
+        "loop_iteration":    (hb or {}).get("loop_iteration"),
+        "started_at":        (hb or {}).get("started_at"),
+        "git_sha":           (hb or {}).get("git_sha"),
+        "windows_today":     windows,
+    }
+
+
+def _inbox_health():
+    try:
+        entries = [
+            f for f in os.listdir(ACTION_INBOX_DIR)
+            if f.endswith(".json") and not f.endswith(".tmp")
+        ]
+    except FileNotFoundError:
+        return {"depth": 0, "oldest_age_s": None}
+    if not entries:
+        return {"depth": 0, "oldest_age_s": None}
+    oldest = min(
+        (_file_mtime_age_s(os.path.join(ACTION_INBOX_DIR, f)) or 0)
+        for f in entries
+    )
+    return {"depth": len(entries), "oldest_age_s": oldest}
+
+
+def _state_health():
+    try:
+        with open(_STATE_FILE) as f:
+            data = json.load(f)
+        return {
+            "age_s":              _file_mtime_age_s(_STATE_FILE),
+            "parseable":          True,
+            "dispatched_count":   len(data.get("dispatched", {})),
+            "pending_count":      len(data.get("pending_approval", {})),
+        }
+    except FileNotFoundError:
+        return {"age_s": None, "parseable": False, "dispatched_count": 0, "pending_count": 0}
+    except (json.JSONDecodeError, OSError):
+        return {
+            "age_s":     _file_mtime_age_s(_STATE_FILE),
+            "parseable": False, "dispatched_count": 0, "pending_count": 0,
+        }
+
+
+def _drift_health():
+    # Phase 2 will populate this. Stub keeps the response shape stable.
+    if not os.path.exists(_DRIFT_REPORT_FILE):
+        return {
+            "available":      False,
+            "report_age_s":   None,
+            "orphans":        0, "untracked":     0,
+            "stale_pendings": 0, "label_mismatch":0, "status_mismatch": 0,
+            "samples":        {},
+        }
+    report = _safe_load_json(_DRIFT_REPORT_FILE, default=None) or {}
+    return {
+        "available":      True,
+        "report_age_s":   _file_mtime_age_s(_DRIFT_REPORT_FILE),
+        "orphans":        report.get("orphans", 0),
+        "untracked":      report.get("untracked", 0),
+        "stale_pendings": report.get("stale_pendings", 0),
+        "label_mismatch": report.get("label_mismatch", 0),
+        "status_mismatch":report.get("status_mismatch", 0),
+        "samples":        report.get("samples", {}),
+    }
+
+
+def _airtable_health():
+    # Phase 2 instruments tracker._airtable_request to write these files.
+    if not os.path.exists(_AIRTABLE_OK_FILE) and not os.path.exists(_AIRTABLE_ERR_FILE):
+        return {"available": False}
+    # Files exist but we'll compute counts in Phase 2 — stub for now.
+    return {
+        "available":           True,
+        "last_success_age_s":  _file_mtime_age_s(_AIRTABLE_OK_FILE),
+        "last_error_ts":       None,
+        "last_error_code":     None,
+        "errors_last_15min":   0,
+        "consecutive_failures":0,
+    }
+
+
+def _disk_health():
+    try:
+        usage = shutil.disk_usage("/opt")
+        return {"opt_used_pct": int(round(100 * usage.used / usage.total))}
+    except OSError:
+        return {"opt_used_pct": None}
+
+
+def _derive_status(snapshot):
+    """
+    Return (status, reasons[]). Status is the worst of any tripped threshold.
+    Reasons are short strings n8n can present to the operator.
+    """
+    reasons   = []
+    severity  = 0   # 0=ok, 1=warn, 2=red
+
+    def bump(level, msg):
+        nonlocal severity
+        if level > severity:
+            severity = level
+        reasons.append(msg)
+
+    sched = snapshot["scheduler"]
+    hb    = sched.get("heartbeat_age_s")
+    if not sched.get("heartbeat_present") or hb is None:
+        bump(2, "scheduler heartbeat missing")
+    elif hb > _HB_RED_S:
+        bump(2, f"scheduler heartbeat stale ({hb}s)")
+    elif hb > _HB_WARN_S:
+        bump(1, f"scheduler heartbeat slow ({hb}s)")
+
+    for label, status in (sched.get("windows_today") or {}).items():
+        if status == "missed":
+            bump(2, f"window {label} missed")
+
+    inbox = snapshot["inbox"]
+    if inbox.get("depth", 0) > _INBOX_WARN_DEPTH:
+        bump(1, f"inbox backlog ({inbox['depth']} files)")
+    if (inbox.get("oldest_age_s") or 0) > _INBOX_WARN_OLDEST:
+        bump(1, f"oldest inbox entry {inbox['oldest_age_s']}s")
+
+    state = snapshot["state"]
+    if not state.get("parseable"):
+        bump(2, "dispatch_state.json unparseable or missing")
+    elif (state.get("age_s") or 0) > _STATE_WARN_AGE_S:
+        bump(1, f"dispatch_state.json untouched {state['age_s']}s")
+
+    drift = snapshot["drift"]
+    if drift.get("available"):
+        if drift.get("orphans", 0) > 0:
+            bump(2, f"drift: {drift['orphans']} orphans in state")
+        if drift.get("stale_pendings", 0) > 0:
+            bump(2, f"drift: {drift['stale_pendings']} stale pendings")
+        if drift.get("untracked", 0) > 0:
+            bump(1, f"drift: {drift['untracked']} untracked in Trello")
+        if drift.get("label_mismatch", 0) > 0:
+            bump(1, f"drift: {drift['label_mismatch']} label mismatches")
+        if drift.get("status_mismatch", 0) > 0:
+            bump(1, f"drift: {drift['status_mismatch']} status mismatches")
+
+    # external_apis.airtable evaluation will fire when Phase 2 instruments it.
+
+    disk = snapshot["disk"]
+    used = disk.get("opt_used_pct")
+    if used is not None:
+        if used > _DISK_RED_PCT:
+            bump(2, f"/opt {used}% full")
+        elif used > _DISK_WARN_PCT:
+            bump(1, f"/opt {used}% full")
+
+    return (["ok", "warn", "red"][severity], reasons)
 
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
