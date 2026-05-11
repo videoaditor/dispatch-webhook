@@ -475,6 +475,16 @@ _STATE_WARN_AGE_S  = 86400   # state file untouched for a day → warn
 _DISK_WARN_PCT     = 80
 _DISK_RED_PCT      = 95
 
+# Airtable error thresholds. consecutive_failures captures "the API is broken
+# right now"; errors_last_15min catches a spray of intermittent failures even
+# if individual calls recover. last_success_age_s catches a quiet stall where
+# nothing is calling Airtable (could be benign overnight, less so during day).
+_AT_CONSEC_RED       = 3
+_AT_CONSEC_WARN      = 1
+_AT_15MIN_RED        = 5
+_AT_15MIN_WARN       = 2
+_AT_NO_SUCCESS_RED_S = 1800   # 30 min of no successful call → red
+
 
 def _file_mtime_age_s(path):
     try:
@@ -581,18 +591,78 @@ def _drift_health():
     }
 
 
+def _parse_iso_utc(ts):
+    if not ts:
+        return None
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+
+
 def _airtable_health():
-    # Phase 2 instruments tracker._airtable_request to write these files.
-    if not os.path.exists(_AIRTABLE_OK_FILE) and not os.path.exists(_AIRTABLE_ERR_FILE):
+    """
+    Compute Airtable signal from telemetry files written by
+    airtable_telemetry.record_success/record_failure:
+      - airtable_last_success.json  (atomic, single ts)
+      - airtable_errors.jsonl       (append-only)
+
+    consecutive_failures = number of trailing error entries that are newer
+    than the most recent success. errors_last_15min counts entries by ts.
+    """
+    have_ok  = os.path.exists(_AIRTABLE_OK_FILE)
+    have_err = os.path.exists(_AIRTABLE_ERR_FILE)
+    if not have_ok and not have_err:
         return {"available": False}
-    # Files exist but we'll compute counts in Phase 2 — stub for now.
+
+    last_success_age_s = _file_mtime_age_s(_AIRTABLE_OK_FILE) if have_ok else None
+    last_success_ts    = None
+    if have_ok:
+        ok = _safe_load_json(_AIRTABLE_OK_FILE, default=None)
+        if isinstance(ok, dict):
+            last_success_ts = _parse_iso_utc(ok.get("ts"))
+
+    last_error_ts        = None
+    last_error_code      = None
+    errors_last_15min    = 0
+    consecutive_failures = 0
+
+    if have_err:
+        # _safe_tail_jsonl is defined above; 500 lines is ~125KB of context,
+        # more than enough to cover any plausible 15 min window of failures.
+        recent = _safe_tail_jsonl(_AIRTABLE_ERR_FILE, n=500)
+        now    = datetime.now(timezone.utc)
+        cutoff = now.timestamp() - 15 * 60
+
+        for entry in recent:
+            ts_str = entry.get("ts")
+            ts_dt  = _parse_iso_utc(ts_str)
+            if ts_dt and ts_dt.timestamp() >= cutoff:
+                errors_last_15min += 1
+
+        if recent:
+            last_entry      = recent[-1]
+            last_error_ts   = last_entry.get("ts")
+            last_error_code = last_entry.get("status_code")
+
+            # Walk backwards counting failures newer than last success.
+            for entry in reversed(recent):
+                ts_dt = _parse_iso_utc(entry.get("ts"))
+                if ts_dt is None:
+                    break
+                if last_success_ts and ts_dt <= last_success_ts:
+                    break
+                consecutive_failures += 1
+
     return {
-        "available":           True,
-        "last_success_age_s":  _file_mtime_age_s(_AIRTABLE_OK_FILE),
-        "last_error_ts":       None,
-        "last_error_code":     None,
-        "errors_last_15min":   0,
-        "consecutive_failures":0,
+        "available":            True,
+        "last_success_age_s":   last_success_age_s,
+        "last_error_ts":        last_error_ts,
+        "last_error_code":      last_error_code,
+        "errors_last_15min":    errors_last_15min,
+        "consecutive_failures": consecutive_failures,
     }
 
 
@@ -656,7 +726,21 @@ def _derive_status(snapshot):
         if drift.get("status_mismatch", 0) > 0:
             bump(1, f"drift: {drift['status_mismatch']} status mismatches")
 
-    # external_apis.airtable evaluation will fire when Phase 2 instruments it.
+    airtable = (snapshot.get("external_apis") or {}).get("airtable") or {}
+    if airtable.get("available"):
+        cf = airtable.get("consecutive_failures") or 0
+        e15 = airtable.get("errors_last_15min") or 0
+        if cf >= _AT_CONSEC_RED:
+            bump(2, f"Airtable: {cf} consecutive failures")
+        elif cf >= _AT_CONSEC_WARN:
+            bump(1, f"Airtable: {cf} consecutive failure(s)")
+        if e15 >= _AT_15MIN_RED:
+            bump(2, f"Airtable: {e15} errors in last 15min")
+        elif e15 >= _AT_15MIN_WARN:
+            bump(1, f"Airtable: {e15} errors in last 15min")
+        age = airtable.get("last_success_age_s")
+        if age is not None and age > _AT_NO_SUCCESS_RED_S:
+            bump(2, f"Airtable: no success in {age}s")
 
     disk = snapshot["disk"]
     used = disk.get("opt_used_pct")
