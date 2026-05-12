@@ -421,8 +421,10 @@ def api_state():
         k: {
             "name":       ed.get("name", k),
             "label_name": ed.get("label_name", ""),
-            "tier":       ed.get("tier", ""),
-            "approved":   ed.get("approved", True),
+            # Status string from Airtable: Active / Paused / Trainee / Archived.
+            # Old registries without the field fall back to "Active" so existing
+            # rows still render until airtable_source.py rewrites them.
+            "status":     ed.get("status") or ("Active" if ed.get("active", True) else "Paused"),
             "brands":     ed.get("brands", []),
             "slack_id":   ed.get("slack_id", ""),
         }
@@ -434,6 +436,9 @@ def api_state():
         "dispatched":       state.get("dispatched", {}),
         "pending_approval": state.get("pending_approval", {}),
         "removed_cards":    state.get("removed_cards", {}),
+        # editor_pauses[editor_key] = iso_utc_expiry; populated by the 🚫 Not available
+        # button (dispatch.on_pause). Used by the SPA to show "paused until …" chips.
+        "editor_pauses":    state.get("editor_pauses", {}),
         "events":           events[-300:],   # most recent 300 — 1-2 weeks worth
         "trust_events":     trust[-500:],
         "editors":          editors_slim,
@@ -550,6 +555,10 @@ def _inbox_health():
 
 
 def _state_health():
+    # registry_age_s tells external monitors how stale the Airtable→registry
+    # cache is. airtable_source.refresh_registry runs at the top of every
+    # scheduler window; expect age <= ~6h under normal operation.
+    registry_age_s = _file_mtime_age_s(_REGISTRY_FILE)
     try:
         with open(_STATE_FILE) as f:
             data = json.load(f)
@@ -558,13 +567,20 @@ def _state_health():
             "parseable":          True,
             "dispatched_count":   len(data.get("dispatched", {})),
             "pending_count":      len(data.get("pending_approval", {})),
+            "paused_editors":     len(data.get("editor_pauses", {})),
+            "registry_age_s":     registry_age_s,
         }
     except FileNotFoundError:
-        return {"age_s": None, "parseable": False, "dispatched_count": 0, "pending_count": 0}
+        return {
+            "age_s": None, "parseable": False, "dispatched_count": 0,
+            "pending_count": 0, "paused_editors": 0,
+            "registry_age_s": registry_age_s,
+        }
     except (json.JSONDecodeError, OSError):
         return {
             "age_s":     _file_mtime_age_s(_STATE_FILE),
             "parseable": False, "dispatched_count": 0, "pending_count": 0,
+            "paused_editors": 0, "registry_age_s": registry_age_s,
         }
 
 
